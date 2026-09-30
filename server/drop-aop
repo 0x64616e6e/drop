@@ -1,0 +1,26 @@
+#!/bin/sh
+# drop-aop status|enforce|relax - Cloudflare Authenticated Origin Pulls for files.este.systems.
+# nginx always asks for Cloudflare's client certificate (ssl_verify_client optional) and logs the
+# result as aop=...; "enforce" refuses requests without it, "relax" goes back to logging only.
+# Turn the feature on in Cloudflare first (SSL/TLS -> Origin Server -> Authenticated Origin Pulls),
+# check that "status" shows only SUCCESS, then enforce.
+set -eu
+SNIPPET=/etc/nginx/snippets/drop-aop.conf
+LOG=/var/log/nginx/files.access.log
+case "${1:-status}" in
+status)
+    echo "enforced: $(grep -q 'ssl_client_verify' "$SNIPPET" 2>/dev/null && echo yes || echo no)"
+    echo "last 200 HTTPS requests by client-certificate result:"
+    tail -n 2000 "$LOG" 2>/dev/null | grep -o 'aop=[A-Z:a-z-]*' | grep -v 'aop=-$' | tail -n 200 | sort | uniq -c
+    ;;
+enforce)
+    ok=$(tail -n 2000 "$LOG" | grep -o 'aop=[A-Z:a-z-]*' | grep -v 'aop=-$' | tail -n 50 | grep -c 'aop=SUCCESS' || true)
+    [ "$ok" -gt 0 ] || { echo "no request with a valid Cloudflare client certificate in the log yet: enable AOP in Cloudflare first" >&2; exit 1; }
+    echo 'if ($ssl_client_verify != SUCCESS) { return 403; }' > "$SNIPPET"
+    nginx -t && systemctl reload nginx && echo "enforced"
+    ;;
+relax)
+    : > "$SNIPPET"; nginx -t && systemctl reload nginx && echo "not enforced (logging only)"
+    ;;
+*) echo "usage: drop-aop status|enforce|relax" >&2; exit 2 ;;
+esac

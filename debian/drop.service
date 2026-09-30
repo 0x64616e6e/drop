@@ -1,0 +1,23 @@
+[Unit]
+Description=drop: one-time file links
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/drop serve
+User=drop
+Group=drop
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/drop /srv/drop/inbox
+ReadOnlyPaths=/srv/drop/files
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+debian/.debhelper/
+debian/drop/
+debian/drop-share/
+debian/files
+debian/*.substvars
+debian/*.debhelper
+debian/debhelper-build-stamp
+__pycache__/

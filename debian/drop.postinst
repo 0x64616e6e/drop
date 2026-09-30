@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    # nginx pieces: the enforcement snippet must exist (empty = Authenticated Origin Pulls not enforced)
+    [ -d /etc/nginx/snippets ] && [ ! -e /etc/nginx/snippets/drop-aop.conf ] && : > /etc/nginx/snippets/drop-aop.conf
+    if [ -d /etc/nginx/sites-available ] && [ ! -e /etc/nginx/sites-available/files.este.systems ]; then
+        cp /usr/share/drop/nginx-files.este.systems.conf /etc/nginx/sites-available/files.este.systems
+    fi
+fi
+#DEBHELPER#

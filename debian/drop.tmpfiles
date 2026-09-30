@@ -1,0 +1,4 @@
+d /var/lib/drop    0750 drop drop     -
+d /srv/drop        0750 drop www-data -
+d /srv/drop/files  0750 drop www-data -
+d /srv/drop/inbox  0750 drop drop     -

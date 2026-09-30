@@ -1,0 +1,29 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_build:
+
+override_dh_auto_test:
+	python3 tests/test_drop.py
+
+override_dh_auto_install:
+	install -D -m 755 server/drop debian/drop/usr/bin/drop
+	install -D -m 755 server/drop-aop debian/drop/usr/sbin/drop-aop
+	install -D -m 644 static/drop.js debian/drop/usr/share/drop/static/drop.js
+	install -D -m 644 contrib/cloudflare-origin-pull-ca.pem debian/drop/usr/share/drop/cloudflare-origin-pull-ca.pem
+	install -D -m 644 contrib/nginx-files.este.systems.conf debian/drop/usr/share/drop/nginx-files.este.systems.conf
+	install -D -m 755 client/share debian/drop-share/usr/bin/share
+
+# sysusers is only in the default sequence from compat 14
+execute_before_dh_installsystemd:
+	dh_installsysusers
+
+# drop.service, plus the named clean-up units drop-gc.service/.timer (the timer is enabled)
+override_dh_installsystemd:
+	dh_installsystemd
+	dh_installsystemd --name=drop-gc
+
+# the watcher is per desktop user: install the user unit but do not enable it for every user
+override_dh_installsystemduser:
+	dh_installsystemduser --no-enable --name=share-watch

@@ -1,0 +1,29 @@
+Source: drop
+Section: web
+Priority: optional
+Maintainer: 0x64616e6e <daniel@este.systems>
+Build-Depends: debhelper-compat (= 13), python3, python3-cryptography
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+
+Package: drop
+Architecture: all
+Depends: ${misc:Depends}, python3 (>= 3.11), openssl
+Recommends: nginx, certbot
+Description: one-time file links behind nginx
+ Share files through links that work once (or a set number of times) and
+ expire. Tokens are stored as hashes; opening a link shows a page and only its
+ button uses the link, so chat-app previews cannot burn it. Supports
+ passphrases, a short retry window after broken downloads, end-to-end
+ encrypted files decrypted in the browser, one-time upload links, and daily
+ clean-up. nginx sends the files (X-Accel-Redirect).
+
+Package: drop-share
+Architecture: all
+Depends: ${misc:Depends}, python3, python3-cryptography, openssh-client, libnotify-bin
+Recommends: qrencode
+Description: laptop client for drop (share)
+ "share" uploads files to a drop server over ssh and prints links (end-to-end
+ encrypted by default), manages links and upload requests, fetches received
+ files, and runs a watcher that sends desktop notifications and feeds a status
+ bar (polybar or Quickshell).

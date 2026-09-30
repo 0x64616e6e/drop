@@ -1,0 +1,11 @@
+[Unit]
+Description=share: notifications and bar data for drop links
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/share watch
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

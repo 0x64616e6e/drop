@@ -1,0 +1,6 @@
+[Unit]
+Description=drop: delete files whose links are all used up or expired
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/drop gc

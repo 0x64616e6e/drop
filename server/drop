@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""drop - one-time file links (and one-time upload links) behind nginx.
+
+Management (run with sudo; files are handled as root, the database as the "drop" user):
+  drop add FILE [--uses N] [--ttl 7d] [--note TEXT] [--pass] [--encrypted --size N]
+  drop link FILE_ID [--uses N] [--ttl 7d] [--note TEXT] [--pass]   another link, one per person
+  drop request [--uses 1] [--ttl 7d] [--max-size 95M] [--note TEXT] [--pass]   upload link (Cloudflare caps bodies at 100 MB)
+  drop list | drop inbox | drop log [-n 20]
+  drop revoke LINK_ID... | --file FILE_ID      drop rm FILE_ID      drop inbox-rm ID
+  drop gc [--keep-days 3] [--events-days 90]  delete files whose links are all dead
+  drop status --json | drop events --since ID --json      for the laptop client (share)
+  drop serve                                  the web service (drop.service)
+
+Links: https://BASE/d/<token> (download), https://BASE/u/<token> (upload). Tokens are 256-bit random,
+stored only as SHA-256. Opening a link shows a page; only its button (a POST/PUT) uses the link, so
+link previews cannot burn it. After a download the same IP may retry for GRACE seconds (broken
+connections). A link can require a passphrase (scrypt-hashed; 5 wrong attempts lock it). Encrypted
+files are ciphertext the server cannot read: the key and the real name travel in the URL fragment
+and the page decrypts in the browser (static/drop.js).
+"""
+import argparse, datetime, grp, hashlib, hmac, html, http.server, json, os, pwd, re, secrets, shutil
+import sqlite3, subprocess, sys, time, urllib.parse
+
+BASE = os.environ.get("DROP_BASE", "https://files.este.systems")
+DB = os.environ.get("DROP_DB", "/var/lib/drop/drop.db")
+FILES = os.environ.get("DROP_FILES", "/srv/drop/files")
+INBOX = os.environ.get("DROP_INBOX", "/srv/drop/inbox")
+STATIC = os.environ.get("DROP_STATIC", "/usr/share/drop/static")
+LISTEN = os.environ.get("DROP_LISTEN", "127.0.0.1:8081")
+CERT = os.environ.get("DROP_CERT", "/etc/letsencrypt/live/files.este.systems/fullchain.pem")
+SERVICE_USER = os.environ.get("DROP_USER", "drop")
+WEB_GROUP = os.environ.get("DROP_WEB_GROUP", "www-data")
+GRACE = int(os.environ.get("DROP_GRACE", "900"))           # seconds a finished download may be retried
+MAX_FAILS = 5                                               # wrong passphrases before a link locks
+VERSION = "0.2.1"
+
+# ---------------------------------------------------------------- storage
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL, added INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS links (hash TEXT PRIMARY KEY, file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    uses_left INTEGER NOT NULL, expires INTEGER NOT NULL, note TEXT, created INTEGER NOT NULL, last_used INTEGER);
+CREATE TABLE IF NOT EXISTS requests (hash TEXT PRIMARY KEY, uses_left INTEGER NOT NULL, expires INTEGER NOT NULL,
+    max_size INTEGER NOT NULL, note TEXT, pass_hash TEXT, fails INTEGER NOT NULL DEFAULT 0,
+    created INTEGER NOT NULL, last_used INTEGER);
+CREATE TABLE IF NOT EXISTS inbox (id TEXT PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+    received INTEGER NOT NULL, request TEXT, ip TEXT, note TEXT);
+CREATE TABLE IF NOT EXISTS events (ts INTEGER NOT NULL, link TEXT, file_id TEXT, ip TEXT, result TEXT, ua TEXT);
+"""
+MIGRATIONS = [   # (table, column, definition): added when missing, so older databases keep working
+    ("files", "encrypted", "INTEGER NOT NULL DEFAULT 0"),
+    ("links", "pass_hash", "TEXT"), ("links", "fails", "INTEGER NOT NULL DEFAULT 0"),
+    ("links", "grace_ip", "TEXT"), ("links", "grace_until", "INTEGER"),
+    ("events", "note", "TEXT"),
+]
+
+def db():
+    c = sqlite3.connect(DB, timeout=15, isolation_level=None)
+    c.execute("PRAGMA foreign_keys = ON")
+    c.executescript(SCHEMA)
+    for table, col, decl in MIGRATIONS:
+        if col not in [r[1] for r in c.execute(f"PRAGMA table_info({table})")]:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+    return c
+
+def thash(token): return hashlib.sha256(token.encode()).hexdigest()
+
+def pass_hash(pw):
+    salt = secrets.token_bytes(16)
+    return "scrypt$" + salt.hex() + "$" + hashlib.scrypt(pw.encode(), salt=salt, n=2**14, r=8, p=1).hex()
+
+def pass_ok(stored, pw):
+    try:
+        _, salt, digest = stored.split("$")
+        return hmac.compare_digest(hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt), n=2**14, r=8, p=1).hex(), digest)
+    except (ValueError, TypeError):
+        return False
+
+def new_pass():                                              # 3x4, unambiguous letters and digits
+    alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+    return "-".join("".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3))
+
+def parse_ttl(s):
+    m = re.fullmatch(r"(\d+)([mhdw])", s)
+    if not m: raise argparse.ArgumentTypeError("ttl like 30m, 12h, 7d, 2w")
+    return int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+)([KMG]?)", s.upper())
+    if not m: raise argparse.ArgumentTypeError("size like 500M or 2G")
+    return int(m.group(1)) * {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}[m.group(2)]
+
+def human(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB": return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+
+def when(ts): return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
+
+def become_service_user():
+    if os.geteuid() == 0:
+        pw = pwd.getpwnam(SERVICE_USER)
+        os.setgroups([]); os.setgid(pw.pw_gid); os.setuid(pw.pw_uid)
+
+def web_readable(*paths):                                    # owned by drop, readable by nginx
+    if os.geteuid() != 0: return
+    uid = pwd.getpwnam(SERVICE_USER).pw_uid; gid = grp.getgrnam(WEB_GROUP).gr_gid
+    for p in paths: os.chown(p, uid, gid); os.chmod(p, 0o750 if os.path.isdir(p) else 0o640)
+
+def sha256_file(path):
+    h = hashlib.sha256(); size = 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""): h.update(chunk); size += len(chunk)
+    return h.hexdigest(), size
+
+# ---------------------------------------------------------------- management
+def add_link(c, file_id, a):
+    token = secrets.token_urlsafe(32); now = int(time.time())
+    pw = new_pass() if a.passphrase else None
+    c.execute("INSERT INTO links (hash, file_id, uses_left, expires, note, created, pass_hash) VALUES (?,?,?,?,?,?,?)",
+              (thash(token), file_id, a.uses, now + a.ttl, a.note, now, pass_hash(pw) if pw else None))
+    return {"url": f"{BASE}/d/{token}", "link_id": thash(token)[:10], "passphrase": pw,
+            "uses": a.uses, "expires": now + a.ttl, "note": a.note}
+
+def emit(a, obj, text):
+    print(json.dumps(obj) if getattr(a, "json", False) else text)
+
+def link_text(r):
+    s = r["url"] + f"\n  {r['uses']} download{'s' if r['uses'] != 1 else ''}, expires {when(r['expires'])}"
+    if r["note"]: s += f", for: {r['note']}"
+    if r["passphrase"]: s += f"\n  passphrase: {r['passphrase']}   (send it by another channel)"
+    return s
+
+def cmd_add(a):
+    src = os.path.abspath(a.file)
+    if not os.path.isfile(src): sys.exit(f"drop: no such file: {src}")
+    name = a.name or os.path.basename(src)
+    if "/" in name or name.startswith(".") or not name: sys.exit("drop: unusable file name")
+    fid = secrets.token_hex(8); d = os.path.join(FILES, fid)
+    os.makedirs(d, mode=0o750); dst = os.path.join(d, name); shutil.copyfile(src, dst)
+    digest, size = sha256_file(dst); web_readable(d, dst)
+    become_service_user(); c = db()
+    c.execute("INSERT INTO files (id, name, size, sha256, added, encrypted) VALUES (?,?,?,?,?,?)",
+              (fid, name, size, digest, int(time.time()), 1 if a.encrypted else 0))
+    r = add_link(c, fid, a); r.update(file_id=fid, name=name, size=size, sha256=digest, encrypted=bool(a.encrypted))
+    emit(a, r, f"file {fid}: {name}, {human(size)}, sha256 {digest[:16]}…" + (" (encrypted)" if a.encrypted else "") + "\n" + link_text(r))
+
+def cmd_link(a):
+    become_service_user(); c = db()
+    row = c.execute("SELECT encrypted FROM files WHERE id=?", (a.file_id,)).fetchone()
+    if not row: sys.exit(f"drop: no file {a.file_id}")
+    r = add_link(c, a.file_id, a); r.update(file_id=a.file_id, encrypted=bool(row[0]))
+    emit(a, r, link_text(r))
+
+def cmd_request(a):
+    become_service_user(); c = db()
+    token = secrets.token_urlsafe(32); now = int(time.time()); pw = new_pass() if a.passphrase else None
+    c.execute("INSERT INTO requests (hash, uses_left, expires, max_size, note, pass_hash, created) VALUES (?,?,?,?,?,?,?)",
+              (thash(token), a.uses, now + a.ttl, a.max_size, a.note, pass_hash(pw) if pw else None, now))
+    r = {"url": f"{BASE}/u/{token}", "link_id": thash(token)[:10], "passphrase": pw, "uses": a.uses,
+         "expires": now + a.ttl, "max_size": a.max_size, "note": a.note}
+    emit(a, r, f"{r['url']}\n  upload link: {a.uses} file{'s' if a.uses != 1 else ''} up to {human(a.max_size)}, "
+               f"expires {when(r['expires'])}" + (f", for: {a.note}" if a.note else "")
+               + (f"\n  passphrase: {pw}   (send it by another channel)" if pw else ""))
+
+def link_state(left, exp, grace_until, now):
+    if left > 0 and exp > now: return f"{left} left"
+    if grace_until and grace_until > now: return "retry ok"
+    return "used up" if left <= 0 else "expired"
+
+def cmd_list(a):
+    become_service_user(); c = db(); now = int(time.time()); out = {"files": [], "requests": []}
+    for fid, name, size, added, enc in c.execute("SELECT id, name, size, added, encrypted FROM files ORDER BY added"):
+        f = {"id": fid, "name": name, "size": size, "added": added, "encrypted": bool(enc), "links": []}
+        for hsh, left, exp, note, used, gu, ph in c.execute(
+                "SELECT hash, uses_left, expires, note, last_used, grace_until, pass_hash FROM links WHERE file_id=? ORDER BY created", (fid,)):
+            f["links"].append({"id": hsh[:10], "state": link_state(left, exp, gu, now), "uses_left": left, "expires": exp,
+                               "note": note or "", "last_used": used, "passphrase": bool(ph)})
+        out["files"].append(f)
+    for hsh, left, exp, mx, note, used, ph in c.execute(
+            "SELECT hash, uses_left, expires, max_size, note, last_used, pass_hash FROM requests ORDER BY created"):
+        out["requests"].append({"id": hsh[:10], "state": link_state(left, exp, None, now), "max_size": mx,
+                                "expires": exp, "note": note or "", "last_used": used, "passphrase": bool(ph)})
+    if a.json: print(json.dumps(out)); return
+    for f in out["files"]:
+        print(f"{f['id']}  {f['name']}  {human(f['size'])}{'  encrypted' if f['encrypted'] else ''}  added {when(f['added'])}")
+        for l in f["links"]:
+            print(f"    link {l['id']}  {l['state']:<9} expires {when(l['expires'])}  last used {when(l['last_used'])}"
+                  f"{'  passphrase' if l['passphrase'] else ''}  {l['note']}")
+    if out["requests"]:
+        print("upload links:")
+        for r in out["requests"]:
+            print(f"    link {r['id']}  {r['state']:<9} max {human(r['max_size'])}  expires {when(r['expires'])}  "
+                  f"last used {when(r['last_used'])}{'  passphrase' if r['passphrase'] else ''}  {r['note']}")
+
+def cmd_inbox(a):
+    become_service_user(); c = db()
+    rows = [dict(zip(("id", "name", "size", "sha256", "received", "ip", "note"), r)) for r in
+            c.execute("SELECT id, name, size, sha256, received, ip, note FROM inbox ORDER BY received")]
+    if a.json: print(json.dumps(rows)); return
+    for r in rows:
+        print(f"{r['id']}  {r['name']}  {human(r['size'])}  received {when(r['received'])} from {r['ip']}  {r['note'] or ''}"
+              f"\n    {os.path.join(INBOX, r['id'], r['name'])}")
+
+def cmd_inbox_rm(a):
+    if not re.fullmatch(r"[0-9a-f]{16}", a.id): sys.exit("drop: bad id")
+    shutil.rmtree(os.path.join(INBOX, a.id), ignore_errors=True)
+    become_service_user(); print("removed" if db().execute("DELETE FROM inbox WHERE id=?", (a.id,)).rowcount else "not in the inbox")
+
+def cmd_revoke(a):
+    become_service_user(); c = db()
+    if a.file: n = c.execute("UPDATE links SET uses_left=0, grace_until=NULL WHERE file_id=?", (a.file,)).rowcount
+    else:
+        n = 0
+        for p in a.prefix:
+            if len(p) < 6: sys.exit("drop: give at least 6 characters of the link id from `drop list`")
+            n += c.execute("UPDATE links SET uses_left=0, grace_until=NULL WHERE hash LIKE ?", (p + "%",)).rowcount
+            n += c.execute("UPDATE requests SET uses_left=0 WHERE hash LIKE ?", (p + "%",)).rowcount
+    print(f"revoked {n} link(s)")
+
+def remove_file(c, fid):
+    shutil.rmtree(os.path.join(FILES, fid), ignore_errors=True)
+    return c.execute("DELETE FROM files WHERE id=?", (fid,)).rowcount
+
+def cmd_rm(a):
+    if not re.fullmatch(r"[0-9a-f]{16}", a.file_id): sys.exit("drop: bad file id")
+    shutil.rmtree(os.path.join(FILES, a.file_id), ignore_errors=True)
+    become_service_user(); print("removed" if db().execute("DELETE FROM files WHERE id=?", (a.file_id,)).rowcount else "no such file")
+
+def cmd_gc(a):
+    """Delete files whose links have all been dead (used up or expired, no retry window) for keep-days,
+    dead upload links as old, and events older than events-days. Runs as drop, which owns the files."""
+    become_service_user(); c = db(); now = int(time.time()); cutoff = now - a.keep_days * 86400; ids = []
+    for fid, added in c.execute("SELECT id, added FROM files").fetchall():
+        rows = c.execute("SELECT uses_left, expires, last_used, grace_until FROM links WHERE file_id=?", (fid,)).fetchall()
+        if any((left > 0 and exp > now) or (gu or 0) > now for left, exp, _, gu in rows): continue
+        died = max([max(min(exp, now), used or 0, gu or 0) for _, exp, used, gu in rows] or [added])
+        if died < cutoff: ids.append(fid)
+    for fid in ids: remove_file(c, fid)
+    ev = c.execute("DELETE FROM events WHERE ts < ?", (now - a.events_days * 86400,)).rowcount
+    rq = c.execute("DELETE FROM requests WHERE (uses_left <= 0 OR expires <= ?) AND created < ?", (now, cutoff)).rowcount
+    if ids: c.execute("INSERT INTO events (ts, result, note) VALUES (?, 'gc', ?)", (now, f"removed {len(ids)} file(s)"))
+    print(f"gc: removed {len(ids)} file(s), {rq} dead upload link(s), {ev} old event(s)")
+
+def cert_days():
+    try:
+        out = subprocess.run(["openssl", "x509", "-enddate", "-noout", "-in", CERT], capture_output=True, text=True, timeout=10).stdout
+        end = datetime.datetime.strptime(out.strip().split("=", 1)[1], "%b %d %H:%M:%S %Y %Z")
+        return int((end - datetime.datetime.utcnow()).total_seconds() // 86400)
+    except Exception:
+        return None
+
+def cmd_status(a):
+    days = cert_days()                                        # the certificate is readable by root only
+    become_service_user(); c = db(); now = int(time.time())
+    s = {"version": VERSION, "cert_days": days,
+         "files": c.execute("SELECT count(*) FROM files").fetchone()[0],
+         "active_links": c.execute("SELECT count(*) FROM links WHERE uses_left > 0 AND expires > ?", (now,)).fetchone()[0],
+         "active_requests": c.execute("SELECT count(*) FROM requests WHERE uses_left > 0 AND expires > ?", (now,)).fetchone()[0],
+         "inbox": c.execute("SELECT count(*) FROM inbox").fetchone()[0],
+         "downloads_24h": c.execute("SELECT count(*) FROM events WHERE result='download' AND ts > ?", (now - 86400,)).fetchone()[0],
+         "last_event": c.execute("SELECT coalesce(max(rowid), 0) FROM events").fetchone()[0]}
+    if a.json: print(json.dumps(s)); return
+    for k, v in s.items(): print(f"{k:<16} {v}")
+
+def cmd_events(a):
+    become_service_user(); c = db()
+    rows = [dict(zip(("id", "ts", "link", "file_id", "ip", "result", "ua", "note"), r)) for r in c.execute(
+        "SELECT rowid, ts, link, file_id, ip, result, ua, note FROM events WHERE rowid > ? ORDER BY rowid LIMIT 500", (a.since,))]
+    names = dict(c.execute("SELECT id, name FROM files").fetchall())
+    for r in rows:
+        r["name"] = names.get(r["file_id"]); r["link"] = (r["link"] or "")[:10]
+    print(json.dumps(rows))
+
+def cmd_log(a):
+    become_service_user(); c = db()
+    for ts, link, fid, ip, res, ua, note in c.execute("SELECT ts, link, file_id, ip, result, ua, note FROM events ORDER BY rowid DESC LIMIT ?", (a.n,)):
+        print(f"{when(ts)}  {res:<9} link {(link or '-')[:10]}  file {fid or '-'}  {ip or '-'}  {note or (ua or '')[:60]}")
+
+# ---------------------------------------------------------------- web
+CSP = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>{title}</title>
+<style>body{{font:16px/1.5 system-ui,sans-serif;background:#0b0c0e;color:#e8dfc9;display:grid;place-items:center;min-height:100vh;margin:0}}
+main{{width:min(30rem,90vw);padding:2rem;border:1px solid #2e333c;background:#121417;box-sizing:border-box}}
+h1{{font-size:1.1rem;margin:0 0 1rem;color:#ffa028;word-break:break-all}}p{{margin:.3rem 0;color:#a39c89}}
+code{{font-size:.8rem;word-break:break-all;color:#e8dfc9}}input{{font:inherit;width:100%;box-sizing:border-box;margin-top:.8rem;padding:.5rem;
+background:#0b0c0e;color:#e8dfc9;border:1px solid #2e333c}}button{{margin-top:1.2rem;font:inherit;padding:.6rem 1.4rem;background:#ffa028;
+color:#0b0c0e;border:0;cursor:pointer}}button:disabled{{opacity:.5}}#status{{margin-top:1rem;color:#e8dfc9}}.bad{{color:#ff4b3e!important}}
+progress{{width:100%;margin-top:1rem}}</style></head><body><main>{body}</main>{script}</body></html>"""
+
+class H(http.server.BaseHTTPRequestHandler):
+    server_version = "drop"; sys_version = ""; protocol_version = "HTTP/1.1"
+    def log_message(self, fmt, *args): pass
+    def ip(self): return self.headers.get("X-Real-IP") or self.client_address[0]
+
+    def event(self, c, link, fid, result, note=None):
+        c.execute("INSERT INTO events (ts, link, file_id, ip, result, ua, note) VALUES (?,?,?,?,?,?,?)",
+                  (int(time.time()), link, fid, self.ip(), result, self.headers.get("User-Agent", "")[:200], note))
+
+    def send(self, code, body=b"", ctype="text/html; charset=utf-8", headers=(), close=False):
+        self.send_response(code)
+        if close: self.send_header("Connection", "close"); self.close_connection = True
+        self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store"); self.send_header("Content-Security-Policy", CSP)
+        for k, v in headers: self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD": self.wfile.write(body)
+
+    def page(self, code, title, body, script=False):
+        tag = '<script src="/assets/drop.js"></script>' if script else ""
+        self.send(code, PAGE.format(title=html.escape(title), body=body, script=tag).encode())
+
+    def gone(self, c, link, fid, why, api=False):
+        self.event(c, link, fid, why)
+        if api: return self.send(404, b"not available", "text/plain")
+        self.page(404, "Link not available", "<h1>This link is not available</h1><p>It has been used, has expired, or never existed.</p>")
+
+    def route(self):
+        m = re.fullmatch(r"/([du])/([A-Za-z0-9_-]{20,100})", urllib.parse.urlsplit(self.path).path)
+        return (m.group(1), m.group(2)) if m else (None, None)
+
+    def form(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 4096: return {}
+        return dict(urllib.parse.parse_qsl(self.rfile.read(n).decode(errors="replace")))
+
+    # ---- GET: pages and the script
+    def do_GET(self):
+        if self.path == "/assets/drop.js":
+            try:
+                with open(os.path.join(STATIC, "drop.js"), "rb") as f: js = f.read()
+            except OSError: return self.send(404, b"", "text/plain")
+            return self.send(200, js, "text/javascript; charset=utf-8")
+        c = db(); kind, t = self.route()
+        if not t: return self.gone(c, None, None, "badpath")
+        (self.get_download if kind == "d" else self.get_upload)(c, t)
+
+    def usable_link(self, c, h, now):
+        row = c.execute("SELECT f.id, f.name, f.size, f.sha256, f.encrypted, l.uses_left, l.expires, l.grace_ip, l.grace_until, "
+                        "l.pass_hash FROM links l JOIN files f ON f.id = l.file_id WHERE l.hash=?", (h,)).fetchone()
+        if not row: return None, None
+        fid, name, size, sha, enc, left, exp, gip, gu, ph = row
+        if left > 0 and exp > now: return row, "fresh"
+        if gu and gu > now and gip == self.ip(): return row, "retry"
+        return None, None
+
+    def get_download(self, c, t):
+        h = thash(t); row, mode = self.usable_link(c, h, int(time.time()))
+        if not row: return self.gone(c, h, None, "refused")
+        fid, name, size, sha, enc, left, exp, gip, gu, ph = row
+        self.event(c, h, fid, "viewed")
+        pw = '<input type="password" name="pass" placeholder="passphrase" autocomplete="off" required>' if ph else ""
+        retry = "<p>You can retry this download for a few minutes.</p>" if mode == "retry" else "<p>This link can be used a limited number of times.</p>"
+        if enc:
+            body = (f'<h1 id="name">Encrypted file</h1><p>{human(size)}, end-to-end encrypted: only your browser can read it.</p>{retry}'
+                    f'<form id="dl" data-mode="decrypt">{pw}<button type="submit">Download</button></form><p id="status"></p>')
+            return self.page(200, "Encrypted file", body, script=True)
+        body = (f"<h1>{html.escape(name)}</h1><p>{human(size)}</p><p>SHA-256 <code>{sha}</code></p>{retry}"
+                f'<form method="post">{pw}<button type="submit">Download</button></form>')
+        self.page(200, name, body)
+
+    def get_upload(self, c, t):
+        h = thash(t); now = int(time.time())
+        r = c.execute("SELECT max_size, pass_hash FROM requests WHERE hash=? AND uses_left > 0 AND expires > ?", (h, now)).fetchone()
+        if not r: return self.gone(c, h, None, "refused")
+        self.event(c, h, None, "viewed-upload")
+        pw = '<input type="password" id="pass" placeholder="passphrase" autocomplete="off" required>' if r[1] else ""
+        body = (f"<h1>Send a file</h1><p>Up to {human(r[0])}. The file goes to the owner of this link only.</p>"
+                f'<form id="ul" data-mode="upload"><input type="file" id="file" required>{pw}<button type="submit">Upload</button></form>'
+                f'<progress id="prog" value="0" max="1" hidden></progress><p id="status"></p>')
+        self.page(200, "Send a file", body, script=True)
+
+    # ---- POST: use a download link
+    def do_POST(self):
+        c = db(); kind, t = self.route()
+        if kind != "d": return self.gone(c, None, None, "badpath")
+        h = thash(t); now = int(time.time()); api = self.headers.get("X-Drop-Api") == "1"
+        pw = self.form().get("pass", "")
+        c.execute("BEGIN IMMEDIATE")                          # decide and consume atomically
+        row, mode = self.usable_link(c, h, now)
+        if not row:
+            c.execute("COMMIT"); return self.gone(c, h, None, "refused", api)
+        fid, name, size, sha, enc, left, exp, gip, gu, ph = row
+        if ph and not pass_ok(ph, pw):
+            fails = c.execute("UPDATE links SET fails = fails + 1 WHERE hash=? RETURNING fails", (h,)).fetchone()[0]
+            if fails >= MAX_FAILS: c.execute("UPDATE links SET uses_left=0, grace_until=NULL WHERE hash=?", (h,))
+            c.execute("COMMIT"); self.event(c, h, fid, "locked" if fails >= MAX_FAILS else "badpass")
+            if api: return self.send(403, b"wrong passphrase", "text/plain")
+            return self.page(403, "Wrong passphrase", "<h1>Wrong passphrase</h1>" + (
+                "<p class=bad>Too many attempts: this link is now locked.</p>" if fails >= MAX_FAILS else
+                f"<p>{MAX_FAILS - fails} attempt(s) left. Go back and try again.</p>"))
+        if mode == "fresh":
+            c.execute("UPDATE links SET uses_left = uses_left - 1, last_used=?, grace_ip=?, grace_until=? WHERE hash=?",
+                      (now, self.ip(), now + GRACE, h))
+        c.execute("COMMIT")
+        self.event(c, h, fid, "download" if mode == "fresh" else "retry")
+        disp = "attachment; filename*=UTF-8''" + urllib.parse.quote("encrypted.bin" if enc else name)
+        self.send(200, b"", "application/octet-stream", [("X-Accel-Redirect", f"/_files/{fid}/{urllib.parse.quote(name)}"),
+                                                        ("Content-Disposition", disp)])
+
+    # ---- PUT: use an upload link (raw body; name in X-Filename, URL-encoded)
+    def do_PUT(self):
+        c = db(); kind, t = self.route()
+        if kind != "u": self.close_connection = True; return self.gone(c, None, None, "badpath", True)
+        h = thash(t); now = int(time.time())
+        try: length = int(self.headers.get("Content-Length", ""))
+        except ValueError: return self.send(411, b"length required", "text/plain", close=True)
+        name = os.path.basename(urllib.parse.unquote(self.headers.get("X-Filename", "")).replace("\\", "/")).strip()
+        name = re.sub(r"[\x00-\x1f]", "", name)[:200].lstrip(".") or "upload.bin"
+        pw = urllib.parse.unquote(self.headers.get("X-Drop-Pass", ""))
+        c.execute("BEGIN IMMEDIATE")
+        r = c.execute("SELECT max_size, pass_hash, note FROM requests WHERE hash=? AND uses_left > 0 AND expires > ?", (h, now)).fetchone()
+        if not r:
+            c.execute("COMMIT"); self.close_connection = True; return self.gone(c, h, None, "refused", True)
+        max_size, ph, note = r
+        if ph and not pass_ok(ph, pw):
+            fails = c.execute("UPDATE requests SET fails = fails + 1 WHERE hash=? RETURNING fails", (h,)).fetchone()[0]
+            if fails >= MAX_FAILS: c.execute("UPDATE requests SET uses_left=0 WHERE hash=?", (h,))
+            c.execute("COMMIT"); self.event(c, h, None, "locked" if fails >= MAX_FAILS else "badpass")
+            return self.send(403, b"wrong passphrase", "text/plain", close=True)
+        if length > max_size:
+            c.execute("COMMIT"); self.event(c, h, None, "toolarge", note=f"{length} > {max_size}")
+            return self.send(413, f"too large: the limit is {human(max_size)}".encode(), "text/plain", close=True)
+        c.execute("UPDATE requests SET uses_left = uses_left - 1, last_used=? WHERE hash=?", (now, h))   # reserve the use
+        c.execute("COMMIT")
+        iid = secrets.token_hex(8); d = os.path.join(INBOX, iid); os.makedirs(d, mode=0o750)
+        path = os.path.join(d, name); hsh = hashlib.sha256(); got = 0
+        try:
+            with open(path + ".part", "wb") as f:
+                while got < length:
+                    chunk = self.rfile.read(min(1 << 20, length - got))
+                    if not chunk: break
+                    f.write(chunk); hsh.update(chunk); got += len(chunk)
+            if got != length: raise IOError(f"short upload {got}/{length}")
+            os.rename(path + ".part", path)
+        except Exception as e:
+            shutil.rmtree(d, ignore_errors=True)
+            c.execute("UPDATE requests SET uses_left = uses_left + 1 WHERE hash=?", (h,))   # give the use back
+            self.event(c, h, None, "upload-failed", note=str(e)[:100])
+            return self.send(400, b"upload incomplete", "text/plain", close=True)
+        c.execute("INSERT INTO inbox VALUES (?,?,?,?,?,?,?,?)", (iid, name, got, hsh.hexdigest(), now, h, self.ip(), note))
+        self.event(c, h, None, "upload", note=f"{name} ({human(got)}) -> inbox {iid}")
+        self.send(200, json.dumps({"ok": True, "name": name, "size": got, "sha256": hsh.hexdigest()}).encode(), "application/json")
+
+    def do_HEAD(self): self.send(405, b"", "text/plain")
+
+def cmd_serve(a):
+    become_service_user(); db().close()
+    host, port = LISTEN.rsplit(":", 1)
+    srv = http.server.ThreadingHTTPServer((host, int(port)), H); srv.daemon_threads = True
+    print(f"drop {VERSION}: serving {BASE} on {LISTEN}", flush=True); srv.serve_forever()
+
+# ---------------------------------------------------------------- cli
+def main():
+    p = argparse.ArgumentParser(prog="drop", description="one-time file links")
+    p.add_argument("--version", action="version", version=VERSION)
+    s = p.add_subparsers(dest="cmd", required=True)
+    def link_opts(q, uses=1):
+        q.add_argument("--uses", type=int, default=uses); q.add_argument("--ttl", type=parse_ttl, default=parse_ttl("7d"))
+        q.add_argument("--note", default=""); q.add_argument("--pass", dest="passphrase", action="store_true", help="require a generated passphrase")
+        q.add_argument("--json", action="store_true")
+    q = s.add_parser("add"); q.add_argument("file"); link_opts(q)
+    q.add_argument("--name", help="store under this name"); q.add_argument("--encrypted", action="store_true", help="the file is client-side encrypted")
+    q = s.add_parser("link"); q.add_argument("file_id"); link_opts(q)
+    q = s.add_parser("request"); link_opts(q); q.add_argument("--max-size", type=parse_size, default=parse_size("95M"), help="default 95M: Cloudflare rejects uploads over 100 MB")
+    for n in ("list", "inbox", "status"): s.add_parser(n).add_argument("--json", action="store_true")
+    q = s.add_parser("inbox-rm"); q.add_argument("id")
+    q = s.add_parser("revoke"); q.add_argument("prefix", nargs="*"); q.add_argument("--file")
+    q = s.add_parser("rm"); q.add_argument("file_id")
+    q = s.add_parser("gc"); q.add_argument("--keep-days", type=int, default=3); q.add_argument("--events-days", type=int, default=90)
+    q = s.add_parser("events"); q.add_argument("--since", type=int, default=0); q.add_argument("--json", action="store_true")
+    q = s.add_parser("log"); q.add_argument("-n", type=int, default=20)
+    s.add_parser("serve")
+    a = p.parse_args()
+    if getattr(a, "uses", 1) < 1: sys.exit("drop: --uses must be at least 1")
+    {"add": cmd_add, "link": cmd_link, "request": cmd_request, "list": cmd_list, "inbox": cmd_inbox, "inbox-rm": cmd_inbox_rm,
+     "revoke": cmd_revoke, "rm": cmd_rm, "gc": cmd_gc, "status": cmd_status, "events": cmd_events, "log": cmd_log,
+     "serve": cmd_serve}[a.cmd](a)
+
+if __name__ == "__main__":
+    main()

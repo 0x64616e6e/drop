@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""share - laptop client for drop on files.este.systems (over ssh to the VPS).
+
+  share add FILE [--uses N] [--ttl 7d] [--note NAME] [--pass] [--plain] [--qr]
+                         upload + first link; end-to-end encrypted unless --plain
+  share link FILE_ID [--uses N] [--ttl 7d] [--note NAME] [--pass] [--qr]   another link (one per person)
+  share request [--uses N] [--ttl 7d] [--max-size 95M] [--note NAME] [--pass] [--qr]   one-time upload link
+  share list | log | inbox | status          share fetch INBOX_ID [DEST]    share inbox-rm INBOX_ID
+  share revoke LINK_ID... | --file FILE_ID   share rm FILE_ID
+  share watch            notifications + bar data (share-watch.service)
+  share bar              one line for polybar/Quickshell     share seen   clear the new-activity counter
+
+Encrypted files: the key never reaches the server. It is kept in ~/.local/share/share/keys.json
+(mode 600) so `share link` can build more links; losing that file means no new links for those files.
+"""
+import argparse, base64, hashlib, json, os, secrets, shlex, subprocess, sys, tempfile, time
+
+HOST = os.environ.get("SHARE_HOST", "whisper")
+KEYS = os.path.expanduser("~/.local/share/share/keys.json")
+CACHE = os.path.expanduser("~/.cache/share")
+STATUS, STATE = os.path.join(CACHE, "status.json"), os.path.join(CACHE, "state.json")
+COLORS = os.path.expanduser("~/.config/polybar/colors.ini")
+POLL = int(os.environ.get("SHARE_POLL", "60"))
+CERT_WARN_DAYS = 20
+
+def ssh(*args, input=None, capture=True, check=True):
+    cmd = ["ssh", "-o", "BatchMode=yes", HOST, " ".join(shlex.quote(a) for a in args)]
+    r = subprocess.run(cmd, input=input, capture_output=capture, text=input is None or isinstance(input, str), timeout=600)
+    if check and r.returncode != 0:
+        sys.exit(f"share: remote command failed: {' '.join(args[:3])}\n{(r.stderr or '').strip()}")
+    return r
+
+def drop(*args, json_out=False):
+    r = ssh("sudo", "drop", *args, *(["--json"] if json_out else []))
+    return json.loads(r.stdout) if json_out else r.stdout
+
+def b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+def load(path, default):
+    try:
+        with open(path) as f: return json.load(f)
+    except (OSError, ValueError): return default
+
+def save(path, obj, mode=0o600):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "w") as f: json.dump(obj, f)
+    os.replace(tmp, path)
+
+def human(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB": return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+
+def when(ts): return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "-"
+
+def link_opts(a):
+    o = ["--uses", str(a.uses), "--ttl", a.ttl]
+    if a.note: o += ["--note", a.note]
+    if a.passphrase: o += ["--pass"]
+    return o
+
+def show(r, url, a):
+    print(url)
+    uses = r.get("uses", 1); what = "upload" if "max_size" in r else "download"
+    print(f"  {uses} {what}{'s' if uses != 1 else ''}, expires {when(r['expires'])}" + (f", for: {r['note']}" if r.get("note") else "")
+          + (f", up to {human(r['max_size'])}" if "max_size" in r else ""))
+    if r.get("passphrase"): print(f"  passphrase: {r['passphrase']}   (send it by another channel)")
+    if a.qr:
+        subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2", url])
+
+def upload(path):
+    remote = ssh("mktemp", "-d", "/tmp/share.XXXXXX").stdout.strip()
+    subprocess.run(["scp", "-q", "-o", "BatchMode=yes", path, f"{HOST}:{remote}/payload"], check=True)
+    return remote
+
+def cmd_add(a):
+    src = os.path.abspath(a.file)
+    if not os.path.isfile(src): sys.exit(f"share: no such file: {src}")
+    name, size = os.path.basename(src), os.path.getsize(src)
+    if a.plain:
+        remote = upload(src)
+        try: r = drop("add", f"{remote}/payload", "--name", name, *link_opts(a), json_out=True)
+        finally: ssh("rm", "-rf", remote, check=False)
+        print(f"file {r['file_id']}: {name}, {human(r['size'])}, sha256 {r['sha256'][:16]}… (not encrypted)")
+        return show(r, r["url"], a)
+    if size > 1024**3:
+        sys.exit("share: over 1 GB, browsers may run out of memory decrypting it; use --plain")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    with open(src, "rb") as f: plain = f.read()
+    key, nonce = AESGCM.generate_key(bit_length=256), secrets.token_bytes(12)
+    sha = hashlib.sha256(plain).hexdigest()
+    with tempfile.NamedTemporaryFile(prefix="share-", suffix=".bin", delete=False) as t:
+        t.write(nonce + AESGCM(key).encrypt(nonce, plain, None)); enc = t.name
+    try:
+        remote = upload(enc)
+        try: r = drop("add", f"{remote}/payload", "--name", secrets.token_hex(6) + ".bin", "--encrypted", *link_opts(a), json_out=True)
+        finally: ssh("rm", "-rf", remote, check=False)
+    finally:
+        os.unlink(enc)
+    keys = load(KEYS, {}); keys[r["file_id"]] = {"k": b64u(key), "name": name, "sha256": sha, "size": size}; save(KEYS, keys)
+    print(f"file {r['file_id']}: {name}, {human(size)}, sha256 {sha[:16]}… (end-to-end encrypted)")
+    show(r, fragment_url(r["url"], keys[r["file_id"]]), a)
+
+def fragment_url(url, k):
+    return f"{url}#k={k['k']}&n={b64u(k['name'].encode())}&h={k['sha256']}"
+
+def cmd_link(a):
+    r = drop("link", a.file_id, *link_opts(a), json_out=True)
+    if r.get("encrypted"):
+        k = load(KEYS, {}).get(a.file_id)
+        if not k:
+            drop("revoke", r["link_id"])
+            sys.exit(f"share: no key for encrypted file {a.file_id} in {KEYS}; the new link was revoked")
+        return show(r, fragment_url(r["url"], k), a)
+    show(r, r["url"], a)
+
+def cmd_request(a):
+    r = drop("request", *link_opts(a), "--max-size", a.max_size, json_out=True)
+    show(r, r["url"], a)
+
+def cmd_rm(a):
+    print(drop("rm", a.file_id).strip())
+    keys = load(KEYS, {})
+    if keys.pop(a.file_id, None) is not None: save(KEYS, keys); print("local key removed")
+
+def cmd_fetch(a):
+    inbox = {i["id"]: i for i in drop("inbox", json_out=True)}
+    item = inbox.get(a.id) or sys.exit(f"share: no inbox item {a.id}")
+    dest = a.dest or os.path.join(os.path.expanduser("~/Downloads"), item["name"])
+    if os.path.isdir(dest): dest = os.path.join(dest, item["name"])
+    if os.path.exists(dest): sys.exit(f"share: {dest} exists")
+    remote = f"/srv/drop/inbox/{item['id']}/{item['name']}"
+    with open(dest, "wb") as out:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", HOST, "sudo cat " + shlex.quote(remote)], stdout=out)
+    if r.returncode != 0: os.unlink(dest); sys.exit("share: fetch failed")
+    with open(dest, "rb") as f: ok = hashlib.sha256(f.read()).hexdigest() == item["sha256"]
+    print(f"{dest}  {human(item['size'])}  sha256 {'verified' if ok else 'MISMATCH'}")
+
+def passthrough(*args): print(drop(*args), end="")
+
+# ---- notifications and bar
+def notify(title, body, urgency="normal"):
+    subprocess.run(["notify-send", "-a", "share", "-u", urgency, "-i", "folder-remote", title, body], check=False)
+
+DESCRIBE = {"download": ("Downloaded", "normal"), "retry": ("Download retried", "low"), "upload": ("File received", "normal"),
+            "locked": ("Link locked (wrong passphrases)", "critical"), "badpass": ("Wrong passphrase", "normal"),
+            "upload-failed": ("Upload failed", "normal"), "toolarge": ("Upload too large", "normal")}
+
+def poll_once(state):
+    status = drop("status", json_out=True)
+    status["updated"] = int(time.time())
+    events = drop("events", "--since", str(state.get("last_event", status["last_event"])), json_out=True) if "last_event" in state else []
+    for e in events:
+        if e["result"] in DESCRIBE:
+            title, urg = DESCRIBE[e["result"]]
+            what = e.get("name") or e.get("note") or ""
+            notify(title, f"{what}\nlink {e['link'] or '-'} from {e['ip']}", urg)
+            if e["result"] in ("download", "upload", "locked"): state["unseen"] = state.get("unseen", 0) + 1
+    state["last_event"] = max([e["id"] for e in events] + [state.get("last_event", status["last_event"])])
+    days = status.get("cert_days")
+    today = time.strftime("%Y-%m-%d")
+    if days is not None and days < CERT_WARN_DAYS and state.get("cert_warned") != today:
+        notify("files.este.systems certificate", f"expires in {days} days; renewal is not working (sudo certbot renew on the VPS)", "critical")
+        state["cert_warned"] = today
+    status["unseen"] = state.get("unseen", 0)
+    save(STATUS, status, 0o644); save(STATE, state)
+
+def cmd_watch(a):
+    state = load(STATE, {})
+    while True:
+        try: poll_once(state)
+        except SystemExit as e: print(e, file=sys.stderr)
+        except Exception as e: print(f"share watch: {e}", file=sys.stderr)
+        if a.once: break
+        time.sleep(POLL)
+
+def color(key, default):
+    try:
+        for line in open(COLORS):
+            if line.split("=")[0].strip() == key: return line.split("=", 1)[1].strip()
+    except OSError: pass
+    return default
+
+def cmd_bar(a):
+    s = load(STATUS, None); now = time.time()
+    muted, accent, urgent, fg = color("fg_muted", "#6B675C"), color("accent", "#FFA028"), color("urgent", "#FF4B3E"), color("fg_dim", "#A39C89")
+    if not s or now - s.get("updated", 0) > max(5 * POLL, 600):
+        print(f"%{{F{muted}}}󰒗 ?%{{F-}}"); return
+    out = f"󰒗 {s['active_links'] + s['active_requests']}"
+    if s.get("unseen"): out += f" %{{F{accent}}}󰇚{s['unseen']}%{{F-}}"
+    if s.get("inbox"): out += f" 󰁅{s['inbox']}"
+    if s.get("cert_days") is not None and s["cert_days"] < CERT_WARN_DAYS: out += f" %{{F{urgent}}}󰄬 cert {s['cert_days']}d%{{F-}}"
+    print(out)
+
+def cmd_seen(a):
+    state = load(STATE, {}); state["unseen"] = 0; save(STATE, state)
+    s = load(STATUS, None)
+    if s: s["unseen"] = 0; save(STATUS, s, 0o644)
+
+def main():
+    p = argparse.ArgumentParser(prog="share", description="one-time links on files.este.systems")
+    sp = p.add_subparsers(dest="cmd", required=True)
+    def lo(q):
+        q.add_argument("--uses", type=int, default=1); q.add_argument("--ttl", default="7d"); q.add_argument("--note", default="")
+        q.add_argument("--pass", dest="passphrase", action="store_true"); q.add_argument("--qr", action="store_true")
+    q = sp.add_parser("add"); q.add_argument("file"); lo(q); q.add_argument("--plain", action="store_true")
+    q = sp.add_parser("link"); q.add_argument("file_id"); lo(q)
+    q = sp.add_parser("request"); lo(q); q.add_argument("--max-size", default="95M")
+    for n in ("list", "inbox", "status", "bar", "seen"): sp.add_parser(n)
+    q = sp.add_parser("log"); q.add_argument("-n", default="20")
+    q = sp.add_parser("revoke"); q.add_argument("prefix", nargs="*"); q.add_argument("--file")
+    q = sp.add_parser("rm"); q.add_argument("file_id")
+    q = sp.add_parser("fetch"); q.add_argument("id"); q.add_argument("dest", nargs="?")
+    q = sp.add_parser("inbox-rm"); q.add_argument("id")
+    q = sp.add_parser("watch"); q.add_argument("--once", action="store_true")
+    a = p.parse_args()
+    if a.cmd == "list": return passthrough("list")
+    if a.cmd == "inbox": return passthrough("inbox")
+    if a.cmd == "status": return passthrough("status")
+    if a.cmd == "log": return passthrough("log", "-n", a.n)
+    if a.cmd == "inbox-rm": return passthrough("inbox-rm", a.id)
+    if a.cmd == "revoke": return passthrough("revoke", *a.prefix, *(["--file", a.file] if a.file else []))
+    {"add": cmd_add, "link": cmd_link, "request": cmd_request, "rm": cmd_rm, "fetch": cmd_fetch,
+     "watch": cmd_watch, "bar": cmd_bar, "seen": cmd_seen}[a.cmd](a)
+
+if __name__ == "__main__":
+    main()

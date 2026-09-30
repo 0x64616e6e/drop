@@ -1,0 +1,27 @@
+drop (0.2.1) unstable; urgency=medium
+
+  * nginx: redacted log paths end in "..." (nginx escaped the Unicode
+    ellipsis).
+
+ -- 0x64616e6e <daniel@este.systems>  Wed, 30 Sep 2026 18:45:00 +0400
+
+drop (0.2.0) unstable; urgency=medium
+
+  * Passphrases per link (scrypt; five wrong attempts lock the link).
+  * Retry window: after a download the same IP may retry for 15 minutes.
+  * End-to-end encrypted files: key and name in the URL fragment, decrypted
+    in the browser (static/drop.js); SHA-256 verified after decryption.
+  * One-time upload links (drop request) with size limit and inbox.
+  * drop gc and a daily timer; status and event feed for the client.
+  * nginx: redacted access logs (no full tokens), rate limit, upload
+    location, Cloudflare Authenticated Origin Pulls (drop-aop).
+  * drop-share: the laptop client (share) with notifications and bar output.
+  * Packaged, with an end-to-end test suite run at build time.
+
+ -- 0x64616e6e <daniel@este.systems>  Wed, 30 Sep 2026 18:00:00 +0400
+
+drop (0.1.0) unstable; urgency=medium
+
+  * First version: one-time download links on files.este.systems.
+
+ -- 0x64616e6e <daniel@este.systems>  Wed, 30 Sep 2026 13:00:00 +0400
