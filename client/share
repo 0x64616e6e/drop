@@ -9,6 +9,7 @@
   share revoke LINK_ID... | --file FILE_ID   share rm FILE_ID
   share watch            notifications + bar data (share-watch.service)
   share bar              one line for polybar/Quickshell     share seen   clear the new-activity counter
+  share panel            open/close the panel (Quickshell): links, activity, inbox, actions
 
 Encrypted files: the key never reaches the server. It is kept in ~/.local/share/share/keys.json
 (mode 600) so `share link` can build more links; losing that file means no new links for those files.
@@ -25,7 +26,9 @@ CERT_WARN_DAYS = 20
 
 def ssh(*args, input=None, capture=True, check=True):
     cmd = ["ssh", "-o", "BatchMode=yes", HOST, " ".join(shlex.quote(a) for a in args)]
-    r = subprocess.run(cmd, input=input, capture_output=capture, text=input is None or isinstance(input, str), timeout=600)
+    # no input: give ssh /dev/null, or it reads the caller's stdin (e.g. `... | while read f; do share rm $f; done`)
+    r = subprocess.run(cmd, input=input, stdin=None if input is not None else subprocess.DEVNULL,
+                       capture_output=capture, text=input is None or isinstance(input, str), timeout=600)
     if check and r.returncode != 0:
         sys.exit(f"share: remote command failed: {' '.join(args[:3])}\n{(r.stderr or '').strip()}")
     return r
@@ -132,7 +135,7 @@ def cmd_fetch(a):
     if os.path.exists(dest): sys.exit(f"share: {dest} exists")
     remote = f"/srv/drop/inbox/{item['id']}/{item['name']}"
     with open(dest, "wb") as out:
-        r = subprocess.run(["ssh", "-o", "BatchMode=yes", HOST, "sudo cat " + shlex.quote(remote)], stdout=out)
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", HOST, "sudo cat " + shlex.quote(remote)], stdout=out, stdin=subprocess.DEVNULL)
     if r.returncode != 0: os.unlink(dest); sys.exit("share: fetch failed")
     with open(dest, "rb") as f: ok = hashlib.sha256(f.read()).hexdigest() == item["sha256"]
     print(f"{dest}  {human(item['size'])}  sha256 {'verified' if ok else 'MISMATCH'}")
@@ -187,9 +190,10 @@ def cmd_bar(a):
     muted, accent, urgent, fg = color("fg_muted", "#6B675C"), color("accent", "#FFA028"), color("urgent", "#FF4B3E"), color("fg_dim", "#A39C89")
     if not s or now - s.get("updated", 0) > max(5 * POLL, 600):
         print(f"%{{F{muted}}}󰒗 ?%{{F-}}"); return
-    out = f"󰒗 {s['active_links'] + s['active_requests']}"
-    if s.get("unseen"): out += f" %{{F{accent}}}󰇚{s['unseen']}%{{F-}}"
-    if s.get("inbox"): out += f" 󰁅{s['inbox']}"
+    n = s["active_links"] + s["active_requests"]
+    out = f"󰒗 {n} link{'s' if n != 1 else ''}"                      # links that still work
+    if s.get("unseen"): out += f" %{{F{accent}}}· {s['unseen']} new%{{F-}}"   # downloads/uploads since you last looked
+    if s.get("inbox"): out += f" · 󰁅 {s['inbox']} received"
     if s.get("cert_days") is not None and s["cert_days"] < CERT_WARN_DAYS: out += f" %{{F{urgent}}}󰄬 cert {s['cert_days']}d%{{F-}}"
     print(out)
 
@@ -197,6 +201,36 @@ def cmd_seen(a):
     state = load(STATE, {}); state["unseen"] = 0; save(STATE, state)
     s = load(STATUS, None)
     if s: s["unseen"] = 0; save(STATUS, s, 0o644)
+
+PANEL_DIRS = [os.environ.get("SHARE_PANEL", ""), "/usr/share/drop-share/panel",
+              os.path.join(os.path.dirname(os.path.realpath(__file__)), "panel")]
+
+def cmd_panel_data(a):
+    """Everything the panel shows, in one ssh round trip, plus the theme colours."""
+    since = max(0, load(STATUS, {}).get("last_event", 0) - 40)
+    script = ("sudo drop status --json; echo; sudo drop list --json; echo; sudo drop inbox --json; echo; "
+              f"sudo drop events --since {since} --json")
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", HOST, script], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        print(json.dumps({"error": (r.stderr or "ssh failed").strip()[:300]})); return
+    status, lst, inbox, events = (json.loads(x) for x in r.stdout.strip().split("\n") if x.strip())
+    colors = {k: color(k, d) for k, d in (("bg", "#121417"), ("block", "#23272E"), ("border", "#2E333C"), ("fg", "#E8DFC9"),
+              ("fg_dim", "#A39C89"), ("fg_muted", "#6B675C"), ("accent", "#FFA028"), ("on_accent", "#0B0C0E"),
+              ("urgent", "#FF4B3E"), ("ok", "#7FBF5A"), ("secondary", "#4992a7"))}
+    status["unseen"] = load(STATE, {}).get("unseen", 0)
+    print(json.dumps({"status": status, "files": lst["files"], "requests": lst["requests"], "inbox": inbox,
+                      "events": events[-25:][::-1], "colors": colors, "keys": list(load(KEYS, {}).keys()),
+                      "names": {fid: k["name"] for fid, k in load(KEYS, {}).items()}}))   # real names of encrypted files
+
+def cmd_panel(a):
+    """Open the panel, or close it if it is open."""
+    d = next((d for d in PANEL_DIRS if d and os.path.isfile(os.path.join(d, "shell.qml"))), None)
+    if not d: sys.exit("share: panel files not found")
+    running = subprocess.run(["qs", "list", "-p", d], capture_output=True, text=True).stdout
+    if "Process ID" in running:
+        subprocess.run(["qs", "kill", "-p", d], capture_output=True)
+    else:
+        subprocess.Popen(["qs", "-p", d, "-d"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 def main():
     p = argparse.ArgumentParser(prog="share", description="one-time links on files.este.systems")
@@ -222,6 +256,7 @@ def main():
     q.add_argument("dest", nargs="?", help="file or directory (default ~/Downloads)")
     q = sp.add_parser("inbox-rm", help="delete a received file on the server"); q.add_argument("id")
     q = sp.add_parser("watch", help="notifications + bar data (share-watch.service)"); q.add_argument("--once", action="store_true", help="poll once and exit")
+    sp.add_parser("panel", help="open or close the panel (Quickshell)"); sp.add_parser("panel-data", help="JSON for the panel")
     a = p.parse_args()
     if a.cmd == "list": return passthrough("list")
     if a.cmd == "inbox": return passthrough("inbox")
@@ -230,7 +265,7 @@ def main():
     if a.cmd == "inbox-rm": return passthrough("inbox-rm", a.id)
     if a.cmd == "revoke": return passthrough("revoke", *a.prefix, *(["--file", a.file] if a.file else []))
     {"add": cmd_add, "link": cmd_link, "request": cmd_request, "rm": cmd_rm, "fetch": cmd_fetch,
-     "watch": cmd_watch, "bar": cmd_bar, "seen": cmd_seen}[a.cmd](a)
+     "watch": cmd_watch, "bar": cmd_bar, "seen": cmd_seen, "panel": cmd_panel, "panel-data": cmd_panel_data}[a.cmd](a)
 
 if __name__ == "__main__":
     main()

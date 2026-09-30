@@ -35,10 +35,22 @@
           const d = hex(await crypto.subtle.digest("SHA-256", plain));
           if (d === h) note = "Decrypted and verified (SHA-256 matches the sender's)."; else { note = "WARNING: checksum does not match the sender's."; bad = true; }
         }
-        const url = URL.createObjectURL(new Blob([plain]));
-        const a = document.createElement("a"); a.href = url; a.download = name; document.body.appendChild(a); a.click();
-        setTimeout(() => URL.revokeObjectURL(url), 60000);
-        say(note + " Saved as " + name + ".", bad);
+        // Browsers only save files in response to a click or tap. Desktop browsers still accept this
+        // one after the download and decryption; iOS Safari does not. So also offer a Save button
+        // (a fresh tap) and, where available, the system share sheet ("Save to Files/Photos").
+        const file = new File([plain], name, { type: "application/octet-stream" });
+        const url = URL.createObjectURL(file);
+        const a = document.createElement("a"); a.href = url; a.download = name; a.textContent = "Save " + name;
+        a.style.cssText = "display:inline-block;margin-top:1rem;padding:.6rem 1.4rem;background:#ffa028;color:#0b0c0e;text-decoration:none";
+        const ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+        dl.replaceWith(a);
+        if (!ios) a.click();
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          const sh = document.createElement("button"); sh.textContent = "Share / Save to Files"; sh.style.marginLeft = ".6rem";
+          sh.addEventListener("click", () => navigator.share({ files: [file] }).catch(() => {}));
+          a.after(sh);
+        }
+        say(note + (ios ? " Tap Save to keep the file." : " If the download did not start, click Save."), bad);
       } catch (err) {
         say("Could not decrypt: the key in this link does not match the file. For a few minutes you can retry from this device.", true);
         btn.disabled = false;

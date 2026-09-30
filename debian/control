@@ -21,9 +21,10 @@ Description: one-time file links behind nginx
 Package: drop-share
 Architecture: all
 Depends: ${misc:Depends}, python3, python3-cryptography, openssh-client, libnotify-bin
-Recommends: qrencode
+Recommends: qrencode, quickshell, xclip
 Description: laptop client for drop (share)
  "share" uploads files to a drop server over ssh and prints links (end-to-end
  encrypted by default), manages links and upload requests, fetches received
  files, and runs a watcher that sends desktop notifications and feeds a status
- bar (polybar or Quickshell).
+ bar (polybar or Quickshell), and a panel (Quickshell) with the links, recent
+ activity, received files and actions.

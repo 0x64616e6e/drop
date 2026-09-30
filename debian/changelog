@@ -1,3 +1,32 @@
+drop (0.2.4) unstable; urgency=medium
+
+  * share: ssh no longer reads the caller's stdin, so share commands work
+    inside `... | while read` loops (the first call swallowed the rest).
+
+ -- 0x64616e6e <daniel@este.systems>  Thu, 01 Oct 2026 11:30:00 +0400
+
+drop (0.2.3) unstable; urgency=medium
+
+  * drop.js: iOS Safari ignored the scripted save after an encrypted download
+    (no user gesture left after fetch + decrypt), so the file was never saved
+    while the page said it was. After decrypting, show a Save button (a fresh
+    tap) and, where available, the share sheet (Save to Files/Photos); the
+    automatic save stays for desktop browsers.
+  * share panel: encrypted files show their real names from the local keys.
+
+ -- 0x64616e6e <daniel@este.systems>  Thu, 01 Oct 2026 11:00:00 +0400
+
+drop (0.2.2) unstable; urgency=medium
+
+  * share panel: a Quickshell window with the links (state, recipient,
+    expiry, last use), upload links, received files and recent activity,
+    with revoke, delete, fetch, new link and new upload link (copied to the
+    clipboard) and mark-seen actions; opened and closed from the bar.
+  * share bar: plain words ("1 link · 2 new · 1 received").
+  * Help texts for every option of share and drop.
+
+ -- 0x64616e6e <daniel@este.systems>  Thu, 01 Oct 2026 10:00:00 +0400
+
 drop (0.2.1) unstable; urgency=medium
 
   * nginx: redacted log paths end in "..." (nginx escaped the Unicode

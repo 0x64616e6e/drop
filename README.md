@@ -13,7 +13,7 @@ files with a few people: no accounts, no SSO, just a link that works once (or N 
 | Link | What happens |
 |---|---|
 | `https://…/d/<token>` | a page with the file name/size (or "Encrypted file") and a Download button. Only the button (POST) uses the link, so chat-app previews cannot burn it |
-| `https://…/d/<token>#k=…&n=…&h=…` | end-to-end encrypted file (default for `share add`): the key, name and SHA-256 are in the fragment, which browsers never send; the page decrypts with WebCrypto and verifies the checksum. The server only has ciphertext |
+| `https://…/d/<token>#k=…&n=…&h=…` | end-to-end encrypted file (default for `share add`): the key, name and SHA-256 are in the fragment, which browsers never send; the page decrypts with WebCrypto and verifies the checksum. The server only has ciphertext. After decrypting, the page shows a Save button (iOS Safari only saves on a direct tap) and, where supported, the share sheet (Save to Files/Photos) |
 | `https://…/u/<token>` | one-time **upload** link: someone sends you a file (up to 95 MB by default, Cloudflare's free plan caps request bodies at 100 MB); it lands in the inbox |
 
 Per link: `--uses N` (default 1), `--ttl 7d`, `--note NAME`, `--pass` (a generated passphrase to send
@@ -58,6 +58,7 @@ Options for every link-creating command (`add`, `link`, `request`):
 | `share watch` | `--once` | poll every 60 s: notifications and bar data (run by `share-watch.service`) |
 | `share bar` | | one status line for polybar or Quickshell, from the watcher's cache |
 | `share seen` | | clear the new-activity counter shown by `share bar` |
+| `share panel` | | open or close the panel (a Quickshell window): links with state, recipient, expiry and last use; upload links; received files; recent activity; buttons to revoke, delete, fetch, make a new link or upload link (copied to the clipboard) and mark activity seen. Escape closes it |
 
 Environment: `SHARE_HOST` (ssh host, default `whisper`), `SHARE_POLL` (seconds, default 60).
 
