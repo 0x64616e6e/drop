@@ -14,7 +14,7 @@
 Encrypted files: the key never reaches the server. It is kept in ~/.local/share/share/keys.json
 (mode 600) so `share link` can build more links; losing that file means no new links for those files.
 """
-import argparse, base64, hashlib, json, os, secrets, shlex, subprocess, sys, tempfile, time
+import argparse, base64, contextlib, fcntl, hashlib, json, os, secrets, shlex, subprocess, sys, tempfile, time
 
 HOST = os.environ.get("SHARE_HOST", "whisper")
 KEYS = os.path.expanduser("~/.local/share/share/keys.json")
@@ -150,29 +150,42 @@ DESCRIBE = {"download": ("Downloaded", "normal"), "retry": ("Download retried", 
             "locked": ("Link locked (wrong passphrases)", "critical"), "badpass": ("Wrong passphrase", "normal"),
             "upload-failed": ("Upload failed", "normal"), "toolarge": ("Upload too large", "normal")}
 
-def poll_once(state):
+@contextlib.contextmanager
+def state_lock():
+    """The watcher and `share seen` both change state.json: serialise them."""
+    os.makedirs(CACHE, exist_ok=True)
+    with open(os.path.join(CACHE, "state.lock"), "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+def poll_once():
+    # read the state fresh every time: `share seen` may have changed it since the last poll
+    with state_lock(): since = load(STATE, {}).get("last_event")
     status = drop("status", json_out=True)
     status["updated"] = int(time.time())
-    events = drop("events", "--since", str(state.get("last_event", status["last_event"])), json_out=True) if "last_event" in state else []
-    for e in events:
-        if e["result"] in DESCRIBE:
-            title, urg = DESCRIBE[e["result"]]
-            what = e.get("name") or e.get("note") or ""
-            notify(title, f"{what}\nlink {e['link'] or '-'} from {e['ip']}", urg)
-            if e["result"] in ("download", "upload", "locked"): state["unseen"] = state.get("unseen", 0) + 1
-    state["last_event"] = max([e["id"] for e in events] + [state.get("last_event", status["last_event"])])
-    days = status.get("cert_days")
-    today = time.strftime("%Y-%m-%d")
-    if days is not None and days < CERT_WARN_DAYS and state.get("cert_warned") != today:
-        notify("files.este.systems certificate", f"expires in {days} days; renewal is not working (sudo certbot renew on the VPS)", "critical")
-        state["cert_warned"] = today
-    status["unseen"] = state.get("unseen", 0)
-    save(STATUS, status, 0o644); save(STATE, state)
+    events = drop("events", "--since", str(since), json_out=True) if since is not None else []
+    with state_lock():
+        state = load(STATE, {})
+        last = state.get("last_event", status["last_event"] if since is None else since)
+        for e in events:
+            if e["id"] <= last: continue                     # already handled (e.g. a concurrent poll)
+            if e["result"] in DESCRIBE:
+                title, urg = DESCRIBE[e["result"]]
+                what = e.get("name") or e.get("note") or (f"file {e['file_id']} (deleted)" if e.get("file_id") else "")
+                notify(title, f"{what}\nlink {e['link'] or '-'} from {e['ip']}", urg)
+                if e["result"] in ("download", "upload", "locked"): state["unseen"] = state.get("unseen", 0) + 1
+            last = e["id"]
+        state["last_event"] = max(last, state.get("last_event", 0))
+        days = status.get("cert_days"); today = time.strftime("%Y-%m-%d")
+        if days is not None and days < CERT_WARN_DAYS and state.get("cert_warned") != today:
+            notify("files.este.systems certificate", f"expires in {days} days; renewal is not working (sudo certbot renew on the VPS)", "critical")
+            state["cert_warned"] = today
+        status["unseen"] = state.get("unseen", 0)
+        save(STATUS, status, 0o644); save(STATE, state)
 
 def cmd_watch(a):
-    state = load(STATE, {})
     while True:
-        try: poll_once(state)
+        try: poll_once()
         except SystemExit as e: print(e, file=sys.stderr)
         except Exception as e: print(f"share watch: {e}", file=sys.stderr)
         if a.once: break
@@ -198,9 +211,10 @@ def cmd_bar(a):
     print(out)
 
 def cmd_seen(a):
-    state = load(STATE, {}); state["unseen"] = 0; save(STATE, state)
-    s = load(STATUS, None)
-    if s: s["unseen"] = 0; save(STATUS, s, 0o644)
+    with state_lock():
+        state = load(STATE, {}); state["unseen"] = 0; save(STATE, state)
+        s = load(STATUS, None)
+        if s: s["unseen"] = 0; save(STATUS, s, 0o644)
 
 PANEL_DIRS = [os.environ.get("SHARE_PANEL", ""), "/usr/share/drop-share/panel",
               os.path.join(os.path.dirname(os.path.realpath(__file__)), "panel")]

@@ -32,7 +32,7 @@ SERVICE_USER = os.environ.get("DROP_USER", "drop")
 WEB_GROUP = os.environ.get("DROP_WEB_GROUP", "www-data")
 GRACE = int(os.environ.get("DROP_GRACE", "900"))           # seconds a finished download may be retried
 MAX_FAILS = 5                                               # wrong passphrases before a link locks
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 
 # ---------------------------------------------------------------- storage
 SCHEMA = """

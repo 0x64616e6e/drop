@@ -1,3 +1,15 @@
+drop (0.2.5) unstable; urgency=medium
+
+  * share watch: "mark seen" did not stick. The watcher loaded its state
+    once and wrote its in-memory copy back after every poll, restoring the
+    counter a minute after `share seen`. It now re-reads the state on every
+    poll; both take a file lock; events are de-duplicated by id.
+  * Notifications for files deleted in the meantime say "file <id> (deleted)"
+    instead of an empty name.
+  * tests/test_share.py (run at build time) covers the watcher and seen.
+
+ -- 0x64616e6e <daniel@este.systems>  Thu, 01 Oct 2026 09:00:00 +0400
+
 drop (0.2.4) unstable; urgency=medium
 
   * share: ssh no longer reads the caller's stdin, so share commands work

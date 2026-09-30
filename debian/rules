@@ -6,6 +6,7 @@ override_dh_auto_build:
 
 override_dh_auto_test:
 	python3 tests/test_drop.py
+	python3 tests/test_share.py
 
 override_dh_auto_install:
 	install -D -m 755 server/drop debian/drop/usr/bin/drop
