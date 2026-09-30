@@ -23,21 +23,68 @@ by another channel; five wrong attempts lock the link). After a download, the sa
 ## Usage
 
 ```
-share add FILE [--plain] [--pass] [--qr] [--note NAME]   # upload, first link
-share link FILE_ID --note NAME                           # another link (one per person)
-share request --note NAME [--max-size 50M]               # upload link
-share list | log | inbox | status
-share fetch INBOX_ID [DEST]                              # download a received file, verify sha256
-share revoke LINK_ID | --file FILE_ID ; share rm FILE_ID ; share inbox-rm ID
+share add FILE --note alice                      # encrypted upload, one link for one download, 7 days
+share add FILE --plain --uses 3 --ttl 2d --qr    # plain file, 3 downloads, 2 days, QR code
+share link FILE_ID --note bob --pass             # a second person's link, with a passphrase
+share request --note carol --max-size 20M        # carol can send you one file up to 20 MB
+share fetch INBOX_ID ~/Downloads/                # download what carol sent, sha256 verified
 ```
 
-Keys of encrypted files live only in `~/.local/share/share/keys.json` (mode 600). `share link` needs
-them; without that file no new links can be made for those files (existing links keep working).
+## share reference (laptop)
 
-`share watch` (`systemctl --user enable --now share-watch`) polls `drop status`/`drop events` every
-60 s over a shared ssh connection, notifies on downloads, uploads, locked links and a certificate
-expiring in under 20 days, and writes `~/.cache/share/status.json`, which `share bar` turns into one
-line for polybar or Quickshell (polybar colour tags).
+Options for every link-creating command (`add`, `link`, `request`):
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--uses N` | 1 | how many times the link works (downloads, or files for an upload link) |
+| `--ttl T` | `7d` | lifetime: a number with `m` (minutes), `h`, `d` or `w`, e.g. `30m`, `12h`, `7d`, `2w` |
+| `--note TEXT` | none | who it is for; shown in `list`, `log` and notifications |
+| `--pass` | off | also require a generated passphrase (`xxxx-xxxx-xxxx`) that is printed once; send it by another channel. Five wrong attempts lock the link |
+| `--qr` | off | also print the link as a QR code in the terminal (needs `qrencode`) |
+
+| Command | Arguments and options | What it does |
+|---|---|---|
+| `share add FILE` | link options, `--plain` | upload FILE and print its first link. End-to-end encrypted unless `--plain`; encrypted files are limited to 1 GB (browser memory) |
+| `share link FILE_ID` | link options | another link to an uploaded file, typically one per person. For encrypted files it needs the key from `~/.local/share/share/keys.json` |
+| `share request` | link options, `--max-size SIZE` (default `95M`; `500K`, `50M`, `1G`) | a one-time upload link; received files land in the inbox. Behind Cloudflare's free plan, bodies over 100 MB are rejected |
+| `share list` | | files with their links (id, state, expiry, last use, note) and upload links |
+| `share log` | `-n N` (default 20) | recent views, downloads, retries, uploads and refusals, with IP |
+| `share inbox` | | received files |
+| `share fetch ID [DEST]` | DEST: file or directory, default `~/Downloads` | download a received file and verify its SHA-256 |
+| `share inbox-rm ID` | | delete a received file on the server |
+| `share revoke LINK_ID...` | or `--file FILE_ID` | disable links (at least 6 characters of the id from `share list`), or every link of a file |
+| `share rm FILE_ID` | | delete a file, its links and its local key |
+| `share status` | | server version, certificate days left, counts, last event |
+| `share watch` | `--once` | poll every 60 s: notifications and bar data (run by `share-watch.service`) |
+| `share bar` | | one status line for polybar or Quickshell, from the watcher's cache |
+| `share seen` | | clear the new-activity counter shown by `share bar` |
+
+Environment: `SHARE_HOST` (ssh host, default `whisper`), `SHARE_POLL` (seconds, default 60).
+
+## drop reference (server, run with sudo)
+
+`share` calls these over ssh; they can also be used directly on the server.
+
+| Command | Arguments and options | What it does |
+|---|---|---|
+| `drop add FILE` | link options, `--name NAME` (store under this name), `--encrypted` (the file is client-side encrypted), `--json` | store a file and print its first link |
+| `drop link FILE_ID` | link options, `--json` | another link to a stored file |
+| `drop request` | link options, `--max-size SIZE` (default `95M`), `--json` | one-time upload link |
+| `drop list` / `drop inbox` / `drop status` | `--json` | files and links / received files / status |
+| `drop log` | `-n N` (default 20) | recent events |
+| `drop events` | `--since ID`, `--json` | events after an id (used by `share watch`) |
+| `drop revoke LINK_ID...` | or `--file FILE_ID` | disable download or upload links |
+| `drop rm FILE_ID` / `drop inbox-rm ID` | | delete a file and its links / a received file |
+| `drop gc` | `--keep-days N` (default 3), `--events-days N` (default 90) | delete files whose links have all been dead for N days, dead upload links, and old events (run daily by `drop-gc.timer`) |
+| `drop serve` | | the web service (`drop.service`) |
+| `drop --version` | | |
+
+The link options (`--uses`, `--ttl`, `--note`, `--pass`) mean the same as for `share`.
+Environment: `DROP_BASE` (public URL), `DROP_DB`, `DROP_FILES`, `DROP_INBOX`, `DROP_STATIC`,
+`DROP_LISTEN` (default `127.0.0.1:8081`), `DROP_CERT`, `DROP_USER`, `DROP_WEB_GROUP`,
+`DROP_GRACE` (retry window in seconds, default 900).
+
+`drop-aop status|enforce|relax` manages Cloudflare Authenticated Origin Pulls (see below).
 
 ## Server
 
