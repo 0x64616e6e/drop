@@ -6,3 +6,4 @@ debian/*.substvars
 debian/*.debhelper
 debian/debhelper-build-stamp
 __pycache__/
+debian/*.debhelper.log
