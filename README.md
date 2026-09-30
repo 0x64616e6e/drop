@@ -8,6 +8,26 @@ files with a few people: no accounts, no SSO, just a link that works once (or N 
 - **share** (laptop, `/usr/bin/share`): uploads over ssh, prints links, manages them, fetches uploads,
   and runs `share watch` for desktop notifications and status-bar data.
 
+## Screenshots
+
+A plain link and an end-to-end encrypted one (the page decrypts in the browser and checks the sender's SHA-256):
+
+<p>
+<img src="docs/download-plain.png" width="49%" alt="download page of a plain file with name, size and SHA-256">
+<img src="docs/download-encrypted-done.png" width="49%" alt="encrypted file decrypted and verified in the browser, with a Save button">
+</p>
+
+A link with a passphrase, and a one-time upload link:
+
+<p>
+<img src="docs/download-passphrase.png" width="49%" alt="download page asking for the passphrase">
+<img src="docs/upload.png" width="49%" alt="one-time upload page">
+</p>
+
+`share panel` on the laptop (demo data), opened from the status bar module <img src="docs/bar.png" height="18" alt="bar module: 4 links, 6 new">:
+
+<img src="docs/panel.png" width="560" alt="share panel: status, shared files with their links, upload links, received files and recent activity, with actions">
+
 ## Links
 
 | Link | What happens |
